@@ -161,7 +161,7 @@ func (h *Handler) ensureProvisioningCluster(logger logr.Logger, service *corev1.
 	return provisioningCluster, nil
 }
 
-func (h *Handler) getRancherResources(logger logr.Logger, service *corev1.Service, provisioningCluster v1unstructured.Unstructured) (isReady bool, managementCluster v1unstructured.Unstructured, clusterRegistrationToken v1unstructured.Unstructured, err error) {
+func (h *Handler) ensureManagementCluster(logger logr.Logger, service *corev1.Service, provisioningCluster v1unstructured.Unstructured) (isReady bool, managementCluster v1unstructured.Unstructured, clusterRegistrationToken v1unstructured.Unstructured, err error) {
 	managementCluster, err = h.LocalUnstructuredClient.GetFirstWithLabel(h.Ctx, gvk.ClustersManagementCattle, constants.LabelVClusterServiceUID, string(service.GetUID()))
 	if err != nil {
 		if kerrors.IsNotFound(err) {
@@ -177,7 +177,16 @@ func (h *Handler) getRancherResources(logger logr.Logger, service *corev1.Servic
 	logger.Info("syncing labels")
 	labels := managementCluster.GetLabels()
 	h.syncLabels(service.Labels, labels)
+	// Pin the provider to "imported" so Rancher's kubernetesprovider controller skips
+	// cloud-provider detection. Without this, Rancher queries the vcluster's nodes and
+	// can misidentify it (e.g. as AKS) based on labels from the underlying host.
+	// Rancher skips detection when both status.provider and the provider.cattle.io label
+	// are non-empty — we must set both.
+	labels["provider.cattle.io"] = "imported"
 	managementCluster.SetLabels(labels)
+	if err := v1unstructured.SetNestedField(managementCluster.Object, "imported", "status", "provider"); err != nil {
+		return false, v1unstructured.Unstructured{}, v1unstructured.Unstructured{}, fmt.Errorf("failed to set provider on management cluster: %w", err)
+	}
 
 	if unstructured.GetNested[bool](provisioningCluster.Object, "status", "ready") {
 		if err := h.LocalUnstructuredClient.Patch(h.Ctx, &managementCluster, client.MergeFrom(orig)); err != nil {
@@ -360,7 +369,7 @@ func (h *Handler) deployvClusterRancherCluster(obj interface{}) error {
 		return err
 	}
 
-	isReady, _, clusterRegistrationToken, err := h.getRancherResources(logger, service, provisioningCluster)
+	isReady, _, clusterRegistrationToken, err := h.ensureManagementCluster(logger, service, provisioningCluster)
 	if err != nil {
 		return fmt.Errorf("failed waiting for rancher to create resource(s) for vCluster: %w", err)
 	}
